@@ -143,9 +143,9 @@ common ones. Null check appears in barriers too but it's so generic so we don't 
 
 
 ## Real code
-Here is a piece of real barrier code from OpenJDK Shenandoah to give you a taste of what it's like.
-TODO insert code here
+Here is a piece of real read barrier code from OpenJDK Shenandoah to give you a taste of what it's like.
 
+[LRB of Shenandoah GC](shenandoah.md)
 
 
 # Cost of read/write barrier
