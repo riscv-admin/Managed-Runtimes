@@ -6,10 +6,10 @@ near a memory read operation or a memory write operation. (More specifically, re
 operations. A reference is an object pointer. There are some exceptions we want to leave out for simplicity.
 So we will refer to them as just read/write.)
 
-Typically 3 GC features requires barriers:
+Typically 3 GC features require barriers:
 * Concurrent Mark (CM): typically requires write or read barrier
 * Concurrent Copy (CC): typically requires read barrier
-* Generational GC: typically requires write barrier
+* Generational GC (GenGC): typically requires write barrier
 
 
 
@@ -19,10 +19,20 @@ We try to summarize the common barrier layouts as follows. These examples are ab
 purposes---you won't know why they are there by looking at the example. But hopefully you don't need to.
 A load is a load. A test is a test. There is no difficulty in understanding these.
 
+What these features have in common is that they bring "concurrency" to the table, which is to say, compared to
+the non-concurrent version of mark or copy (generational GC is practically always concurrent so there is no
+non-concurrent generational GC), mutators (i.e., application threads) and GC threads run at the same time. There needs
+to be some sort of synchronization between them. By inserting barrier code into application code, mutators can
+synchronize with GC threads. In order for GC algorithm to not break under concurrency, the barrier gurantees certain
+things, e.g., for CM it's strong/weak tri-color invariant, for CC it's commonly to-space invariant.
 
 
-Barriers need to be short and fast. Usually they are laid down with at least a fast and a slow path. A very critical part
-in a barrier then, in this respect, is the check for fast/slow path condition. This check's frequency is a ratio
+
+Barriers need to be short and fast. Usually they are laid down with at least a fast and a slow path.
+When certain conditions are met, mutators can skip barrier altogether, that is, going fast-path
+(a good example is the GC state check below),
+Since in the fastest path, mutators still need to at least check for a fast/slow path condition,
+a very critical part in a barrier then is this check. This check's frequency is a ratio
 of the frequency of read or write operations. A barrier can have multiple nested checks. The outermost one
 will be the cheapest; the innermost one will be the most precise, but probably laid down further from the
 read/write due to higher cost. These checks are interesting because they are a major source of barrier cost and
@@ -36,7 +46,8 @@ So we mainly discuss just these checks and omit the rest.
 
 
 ## Type 1: GC state check
-In many cases, the first check in the barrier is a GC state check. A write barrier for concurrent
+In many cases, the first check in the barrier is a GC state check.
+This can be seen in CM or CC, read or write barriers. A write barrier for concurrent
 marking purpose (SATB-style) can look like:
 ```
 gc_state_check:
@@ -51,7 +62,7 @@ In practice, GC state check costs very little. We revisit this later.
 
 ## Type 2: Region check
 Sometimes a pointer's src or dst needs to be checked against a table for information about the
-src or dst's GC state. For example,
+src or dst's GC state. This can be seen in CC read barriers or GenGC write barriers. For example,
 a read barrier for concurrent copy can look like:
 ```
 read:
@@ -76,7 +87,7 @@ They are all very similar---compute the index from a raw pointer in some way (mo
 then look the index up in a table (containing GC metadata). If the table says this pointer belongs to a region
 that needs special handling, the execution jumps to a slow path (not shown in example).
 
-Why do we put these two barriers together? Because they can be optimized by these interesting
+Why do we put these two barriers together? Because they can be optimized by this interesting
 memory protection feature:
 [s390's Guarded-Storage](https://itdks.su.bcebos.com/51917c6806dc413b949c8c42d71c778b.pdf),
 [SOAR](https://dl.acm.org/doi/abs/10.1145/800015.808182) (I didn't know this until
@@ -90,7 +101,7 @@ above but it's too fine-grained for protection to discriminate different cards, 
 
 ## Type 3: Bitmap check
 Marking commonly uses bitmap because its space efficiency to keep track of the marking state of each object.
-CM (SATB-style) that uses bitmap requires a bitmap check like this:
+This can be see in CM write barriers. It Looks like this (SATB-style):
 ```
 bitmap_check:
   load r1, (rd)                ;; load the old pointer before the following update overwrites it
@@ -110,6 +121,7 @@ It's similar for our other examples.
 ## Type 4: Tagged pointers
 Some GCs maintain tagged pointers. In their (for example) read barriers they can tell if a pointer points
 to a from-space object by looking at the tag. If it does, the execution goes into a slow path (not shown in example).
+This is currently seen in CC or CM's read barriers.
 The barrier looks like:
 ```
 read:
@@ -127,11 +139,11 @@ for the future generational ZGC.
 
 By moving the tags to some "ignored bits", ZGC would need less virtual space, and thus fewer page table entries,
 which is in theory good for performance. For some unclear reason ZGC did not use the already-available TBI
-(Top-Byte Ignore) in their ARM port. [C4](https://dl.acm.org/doi/10.1145/2076022.1993491) on the other handle,
+(Top-Byte Ignore) in their ARM port. [C4](https://dl.acm.org/doi/10.1145/2076022.1993491) on the other hand,
 has specialized hardware support. If run on their custom hardware, It can do tag checking using a special instruction.
 
 ## Type 5: Header check
-Metadata can be encoded into object or page headers, or headers of any self-defined memory managed unit.
+Metadata can be encoded into object or page headers, or headers of any self-defined memory management unit.
 In which case the barrier finds
 the header of the object or page pointed to by a pointer, and checks for slow path.
 It's seen in ART CC (BakerReadBarrier), V8 (barrier for generational GC).
@@ -160,6 +172,8 @@ read barriers cost up to ~15%)
 * [Go](https://go.dev/blog/ismmkeynote) (implies write barriers cost 4%-7%; also write barriers
 made them give up "ROC" and generational GC)
 
+Read barriers generally cost more because reads are much more common than writes.
+Also this data is pure barrier cost. The cost of concurrency is much higher than barrier cost.
 To make precise measurement is hard and it depends on specific runtime, hardware, and workload.
 
 How do we understand the cost?
@@ -199,8 +213,8 @@ Instead of listing all types of GCs and all types of their barriers,
 the goal is to find the most reasonable thing to work on so as to help a largest subset of them.
 
 There are two general considerations for (server) GC: throughput and response time.
-Throughput GC benefits hugely from generational GC; RT GC benefits hugely from CC.
-Throughput GC rejects CC because CC depends on the higher-costing read barriers (write-barrier CC exists
+Throughput benefits hugely from generational GC; RT benefits hugely from CC.
+Throughput workloads reject CC because CC depends on the higher-costing read barriers (write-barrier CC exists
 [theoretically](https://dl.acm.org/doi/pdf/10.1145/376656.376810)).
 
 In weaker hardware (smart phones, embedded systems), memory and energy conservation become another concern.
