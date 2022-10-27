@@ -188,23 +188,86 @@ cache, register allocation.
 
 
 
-## Further notes on tag checking vs. region checking
-The tagged-pointer-based checks are faster than region checks in general.
-First of all, tag checking is shorter; doing a shift then a table entry load is slightly longer in number of instrs.
-Secondly, the ``#mask_addr`` is usually a
-constant, and loading from a constant address is faster than loading a table entry, which has variable address.
-Some GC (e.g., Shenandoah) would put the region check in its
-"middle path", and insert a explicit GC-state check in its fast path to shortcut the middle path. Even though
-it's perfectly fine to encode GC states in the table, e.g., when GC is not in action, zero all table entries.
-It shows that Shenandoah considers region check expensive enough to worth another if-check to shortcut it.
-OTOH, the tag checking relies on the fact that GC maintains tagged pointers for the entire heap, whereas region checks
-relies on maintaining a table (cheaper). Those are design choices that different GC algorithms took.
+> Further notes on tag checking vs. region checking
+>
+> The tagged-pointer-based checks are faster than region checks in general.
+> First of all, tag checking is shorter; doing a shift then a table entry load is slightly longer in number of instrs.
+> Secondly, the ``#mask_addr`` is usually a
+> constant, and loading from a constant address is faster than loading a table entry, which has variable address.
+> Some GC (e.g., Shenandoah) would put the region check in its
+> "middle path", and insert a explicit GC-state check in its fast path to shortcut the middle path. Even though
+> it's perfectly fine to encode GC states in the table, e.g., when GC is not in action, zero all table entries.
+> It shows that Shenandoah considers region check expensive enough to worth another if-check to shortcut it.
+> OTOH, the tag checking relies on the fact that GC maintains tagged pointers for the entire heap, whereas region checks
+> relies on maintaining a table (cheaper). Those are design choices that different GC algorithms took.
+>
+> Anyway, this is probably too implementation specific.
+> The point is, if there is a hardware magic that helps us get rid of the cost of one type of barrier.
+> I personally would be more happy if it can get rid of the region-checking barriers. But that's to assume the effort
+> to create such a magic is the same. OTOH, the GC algorithms are not non-negotiable. If one algorithm is superior
+> because of a hardware magic helps elide its barrier, GC will be more likely to adopt it.
 
-Anyway, this is probably too implementation specific.
-The point is, if there is a hardware magic that helps us get rid of the cost of one type of barrier.
-I personally would be more happy if it can get rid of the region-checking barriers. But that's to assume the effort
-to create such a magic is the same. OTOH, the GC algorithms are not non-negotiable. If one algorithm is superior
-because of a hardware magic helps elide its barrier, GC will be more likely to adopt it.
+
+
+# State of the art in barrier reduction
+Here we list some interesting directions that are undertaken by GCs. The first two are rather recent (2022).
+
+## Read-barrier-less concurrent compaction using kernel feature userfaultfd
+[Android 13](https://android-developers.googleblog.com/2022/08/android-13-is-in-aosp.html)
+seems to try to upgrade its GC from Concurrent Copy to Concurrent Mark Compact (CMC), who has utilized a kernel
+feature called userfaultfd to reach read-barrier-lessness. In short, userfaultfd lets user-space program
+handle the page fault events itself. We all know that normally upon page fault, if it's a write to a missing page,
+kernel would try to supply an empty one; if it's a read to a missing page, kernel would supply a zero page.
+Well with userfaultfd, user-space program can now listen to the faults, and redefine the behaviour upon
+page faults. That means, e.g., we can supply a page with arbitrary content upon a read.
+
+Here comes Concurrent Compaction. Compaction is a special kind of Copy. In GC terminology it usually implies
+that the dest addresses of live object copying is precomputed and more organized. But this doesn't change
+the fact that if it's to be concurrent, it needs a read barrier. Android's CMC eliminates read barriers by
+remapping the heap to a different address, so that mutators all see a big vacuum where there is no physcial pages
+and trigger page faults; then GC threads would handle the page faults themselfs by copying the remapped heap
+back to vacuum page-by-page; in the mean time, GC updates all object references in a page with the correct
+post-compaction addresses before waking up a mutator thread that blocks on a page fault.
+
+CMC claims to reach 10% reduction in code size due to elimination of read barriers.
+
+## The new Generational ZGC (GenZ) under development
+The [GenZ](https://bugs.openjdk.org/browse/JDK-8272979) description is an interesting read. It
+demonstrates what the Z devs think when designing the barriers, e.g., how the work are distributed into fast and
+slow path; it solves some of the mysteries why ZGC haven't used TBI-like feature---they plan to remove
+multi-mapping in GenZ and there are a lot more metadata bits now; it mentions using code patching to squeeze
+more performance from the barrier.
+
+The code patching is worth some awareness because its architecture relevance, i.e., not every arch supports
+patching and not every instruction supports patching.
+([More reading](http://cr.openjdk.java.net/~jrose/jvm/hotspot-cmc.html).)
+Restrictions aside, let's see how it works. Remember we talked about [GC state checks](## Type 1: GC state check).
+GC state as a variable could stay unchanged for a long time---it usually changes when GC switches phases. So
+to avoid having to load a state from the memory only to discover it's the same boring value again and again,
+ZGC can patch the mem-load with imm-load, saving the memory visit cost. (The document didn't mention whether
+it's a load or not. I infer that. In tag-checking GC, it's also not a "state" but specifically a "color", but
+the idea can be generalized.)
+
+## Trap-based barrier reduction with memory protection
+We mentioned [s390's Guarded-Storage](https://itdks.su.bcebos.com/51917c6806dc413b949c8c42d71c778b.pdf) which can
+be used to implement an efficient barrier. This can be generalize as a trap-based barrier reduction technique.
+The gist of it is letting the trap (synchronized exception) conditional replace the
+software condition (so the barrier is near 0 code size), letting the trap handler replace the barrier slow path,
+and letting GC set the proper trap condition.
+
+Memory protection can be used to accomplish this. For example, x86's Memory Protection Keys For Userspace will
+do, albeit a little awkward because it's not designed for this. More importantly,
+the critical issue with this kind of technique is the performance of traps. Specifically, can traps be core-local?
+Can they be user-spaced? Because trapping into kernel is very expensive.
+For these properties we need more architectural support, like what s390 provides.
+
+## Trap-based barrier reduction with tag checking
+This is similar to the above approach (can even be considered a special case). The representative is
+[C4](https://dl.acm.org/doi/10.1145/2076022.1993491). C4 installs "NMT" bits in a pointer, which if not matching the
+pre-conditioned bits, will trap a mutator that dereferences it. C4 makes the trap very fast with a special TLB
+mode in custom hardware/kernel.
+
+Similarly, ARM has Memory Tagging Extension, but not providing the fast traps that we hope for.
 
 
 
